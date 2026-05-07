@@ -147,12 +147,24 @@ SampledPoints poisson_disk_sample(const Mesh& mesh, double min_radius,
 }
 
 // ---------------------------------------------------------------------------
-// I/O
+// I/O  (PLY ASCII with x y z nx ny nz — importable in Blender as point cloud)
 // ---------------------------------------------------------------------------
 
 void save_points(const std::string& path, const SampledPoints& pts) {
     std::ofstream f(path);
     if (!f) throw std::runtime_error("Cannot write: " + path);
+
+    f << "ply\n"
+      << "format ascii 1.0\n"
+      << "element vertex " << pts.positions.size() << "\n"
+      << "property double x\n"
+      << "property double y\n"
+      << "property double z\n"
+      << "property double nx\n"
+      << "property double ny\n"
+      << "property double nz\n"
+      << "end_header\n";
+
     f.precision(10);
     for (size_t i = 0; i < pts.positions.size(); i++) {
         const auto& p = pts.positions[i];
@@ -165,16 +177,50 @@ void save_points(const std::string& path, const SampledPoints& pts) {
 SampledPoints load_points(const std::string& path) {
     std::ifstream f(path);
     if (!f) throw std::runtime_error("Cannot open: " + path);
-    SampledPoints pts;
+
     std::string line;
-    while (std::getline(f, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        std::istringstream ss(line);
+    std::getline(f, line);
+
+    // PLY file
+    if (line == "ply") {
+        int n_verts = 0;
+        // Minimal header parse: find "element vertex N" and "end_header".
+        while (std::getline(f, line)) {
+            std::istringstream ss(line);
+            std::string tok;
+            ss >> tok;
+            if (tok == "element") {
+                std::string name; ss >> name >> n_verts;
+            } else if (tok == "end_header") {
+                break;
+            }
+        }
+        SampledPoints pts;
+        pts.positions.reserve(n_verts);
+        pts.normals.reserve(n_verts);
+        for (int i = 0; i < n_verts && std::getline(f, line); i++) {
+            std::istringstream ss(line);
+            Vec3 p, n;
+            if (ss >> p.x >> p.y >> p.z >> n.x >> n.y >> n.z) {
+                pts.positions.push_back(p);
+                pts.normals.push_back(n);
+            }
+        }
+        return pts;
+    }
+
+    // Legacy plain-text fallback: first line was already read, re-process it.
+    SampledPoints pts;
+    auto parse_line = [&](const std::string& ln) {
+        if (ln.empty() || ln[0] == '#') return;
+        std::istringstream ss(ln);
         Vec3 p, n;
         if (ss >> p.x >> p.y >> p.z >> n.x >> n.y >> n.z) {
             pts.positions.push_back(p);
             pts.normals.push_back(n);
         }
-    }
+    };
+    parse_line(line);
+    while (std::getline(f, line)) parse_line(line);
     return pts;
 }

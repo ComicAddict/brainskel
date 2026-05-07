@@ -8,12 +8,12 @@
 
 static void usage(const char* argv0) {
     std::cerr <<
-        "Usage: " << argv0 << " <input.(obj|ply)> <output.xyz>\n"
+        "Usage: " << argv0 << " <input.(obj|ply)> <output.ply>\n"
         "                   [--radius R]   minimum sample distance (default: auto)\n"
         "                   [--seed S]     RNG seed (default: 42)\n"
         "\n"
-        "Samples points on the mesh surface using Poisson-disk sampling and\n"
-        "writes them as a plain-text file (x y z nx ny nz per line).\n";
+        "Samples points on the mesh surface using Poisson-disk sampling.\n"
+        "Output is a PLY point cloud (x y z nx ny nz) importable in Blender.\n";
 }
 
 int main(int argc, char** argv) {
