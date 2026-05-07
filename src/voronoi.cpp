@@ -4,6 +4,9 @@
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
+#include <vector>
+
+#include <omp.h>
 
 #include "mesh.hpp"
 #include "voro++.hh"
@@ -36,7 +39,7 @@ MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon) {
     bmin.x -= pad; bmin.y -= pad; bmin.z -= pad;
     bmax.x += pad; bmax.y += pad; bmax.z += pad;
 
-    // Choose grid block counts: aim for ~8 particles per block.
+    // Grid block counts: aim for ~8 particles per block.
     int n_total = 2 * N;
     double cbrt_n = std::cbrt(static_cast<double>(n_total) / 8.0);
     double dx = bmax.x - bmin.x, dy = bmax.y - bmin.y, dz = bmax.z - bmin.z;
@@ -55,62 +58,104 @@ MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon) {
     for (int i = 0; i < n_total; i++)
         con.put(i, all[i].x, all[i].y, all[i].z);
 
-    // Collect qualifying Voronoi faces as a raw vertex soup.  The same
-    // geometric vertex will appear once per adjacent cell with minutely
-    // different floating-point values; weld_vertices() fuses them afterward.
-    MedialAxisMesh result;
+    // ---- Collect particle descriptors serially ----------------------------
+    // We need (ijk, q, i, j, k) to call voro_compute::compute_cell later.
+    // The loop itself is not thread-safe, so this pass is serial.
+    struct Particle { int id, ijk, q, ci, cj, ck; };
+    std::vector<Particle> particles;
+    particles.reserve(n_total);
 
-    voro::c_loop_all vl(con);
-    voro::voronoicell_neighbor vc;
+    {
+        voro::c_loop_all vl(con);
+        if (vl.start()) do {
+            particles.push_back({vl.pid(), vl.ijk, vl.q, vl.i, vl.j, vl.k});
+        } while (vl.inc());
+    }
 
-    if (!vl.start()) return result;
+    // ---- Parallel Voronoi cell computation --------------------------------
+    //
+    // voro_compute<container> owns all mutable working state (mask, queue).
+    // The container's particle arrays are read-only at this point, so
+    // multiple voro_compute instances can safely share the same container.
+    //
+    // For a non-periodic container voro++ initialises its internal
+    // voro_compute with mask dims == grid dims (gnx, gny, gnz).
+    // We replicate that here for each per-thread instance.
+    //
+    // Each thread accumulates into a private MedialAxisMesh; threads merge
+    // results afterward (no locks needed during the parallel section).
 
-    do {
-        if (!con.compute_cell(vc, vl)) continue;
+    int n_threads = omp_get_max_threads();
+    std::vector<MedialAxisMesh> thread_meshes(n_threads);
 
-        int id = vl.pid();
-        if (id >= N) continue;  // only process inside points
+    #pragma omp parallel default(none) \
+        shared(particles, con, thread_meshes, N, gnx, gny, gnz)
+    {
+        int tid = omp_get_thread_num();
+        MedialAxisMesh& local = thread_meshes[tid];
 
-        double cx = vl.x(), cy = vl.y(), cz = vl.z();
+        // Per-thread Voronoi compute engine.
+        voro::voro_compute<voro::container> local_vc(con, gnx, gny, gnz);
+        voro::voronoicell_neighbor vc;
 
-        std::vector<int> neigh;
-        vc.neighbors(neigh);  // one entry per face
-
+        // Reusable scratch vectors (avoid repeated allocations).
+        std::vector<int>    neigh, fv;
         std::vector<double> v;
-        vc.vertices(cx, cy, cz, v);  // absolute positions, flat [x0,y0,z0,...]
 
-        std::vector<int> fv;
-        vc.face_vertices(fv);  // [n0, vi0, vi1, ..., n1, ...]
+        #pragma omp for schedule(dynamic, 32)
+        for (int idx = 0; idx < static_cast<int>(particles.size()); idx++) {
+            const Particle& pi = particles[idx];
+            if (pi.id >= N) continue;  // skip outside-displaced points
 
-        int fi = 0;
-        for (int f = 0; f < static_cast<int>(neigh.size()); f++) {
-            int n_verts = fv[fi++];
-            int nb = neigh[f];
+            if (!local_vc.compute_cell(vc, pi.ijk, pi.q, pi.ci, pi.cj, pi.ck))
+                continue;
 
-            // Keep faces shared by two inside points.
-            // Record only from the cell with the smaller ID to avoid duplicates.
-            if (nb >= 0 && nb < N && id < nb) {
-                int base = static_cast<int>(result.vertices.size());
-                for (int k = 0; k < n_verts; k++) {
-                    int vi = fv[fi + k];
-                    result.vertices.push_back({v[3*vi], v[3*vi+1], v[3*vi+2]});
+            vc.neighbors(neigh);
+            vc.vertices(con.p[pi.ijk][con.ps * pi.q],
+                        con.p[pi.ijk][con.ps * pi.q + 1],
+                        con.p[pi.ijk][con.ps * pi.q + 2], v);
+            vc.face_vertices(fv);
+
+            int fi = 0;
+            for (int f = 0; f < static_cast<int>(neigh.size()); f++) {
+                int n_verts = fv[fi++];
+                int nb = neigh[f];
+
+                // Keep only faces between two inside-displaced points;
+                // record from the cell with the smaller ID to avoid duplicates.
+                if (nb >= 0 && nb < N && pi.id < nb) {
+                    int base = static_cast<int>(local.vertices.size());
+                    for (int k = 0; k < n_verts; k++) {
+                        int vi = fv[fi + k];
+                        local.vertices.push_back(
+                            {v[3*vi], v[3*vi+1], v[3*vi+2]});
+                    }
+                    std::vector<int> face_idx(n_verts);
+                    std::iota(face_idx.begin(), face_idx.end(), base);
+                    local.faces.push_back(std::move(face_idx));
                 }
-                std::vector<int> face_idx(n_verts);
-                std::iota(face_idx.begin(), face_idx.end(), base);
-                result.faces.push_back(std::move(face_idx));
+
+                fi += n_verts;
             }
-
-            fi += n_verts;
         }
-    } while (vl.inc());
+    }  // end parallel
 
-    // Weld: merge vertices within a tolerance that absorbs the floating-point
-    // differences between adjacent cells, while staying far below any real
-    // geometric feature.  1e-7 * extent is ~10^7 x larger than double-precision
-    // noise yet ~10^5 x smaller than the minimum Voronoi edge for typical inputs.
-    // Tolerance: large enough to absorb inter-cell fp disagreement on the same
-    // Voronoi vertex (~1e-10 for brain-scale coords), far smaller than any
-    // real Voronoi edge (typically >> epsilon).
+    // ---- Merge per-thread results -----------------------------------------
+    // Concatenate vertex lists; offset face indices of each shard.
+    MedialAxisMesh result;
+    for (auto& mesh : thread_meshes) {
+        int base = static_cast<int>(result.vertices.size());
+        result.vertices.insert(result.vertices.end(),
+                               mesh.vertices.begin(), mesh.vertices.end());
+        for (auto& face : mesh.faces) {
+            result.faces.push_back(face);
+            for (int& vi : result.faces.back()) vi += base;
+        }
+    }
+
+    // ---- Weld near-duplicate vertices ------------------------------------
+    // Tolerance absorbs inter-cell floating-point disagreement while staying
+    // far below any real Voronoi edge length.
     double weld_tol = std::max(extent * 1e-7, 1e-12);
     weld_vertices(result.vertices, result.faces, weld_tol);
 

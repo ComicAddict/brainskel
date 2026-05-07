@@ -4,6 +4,8 @@
 #include <stdexcept>
 #include <string>
 
+#include <omp.h>
+
 #include "mesh.hpp"
 #include "sampling.hpp"
 #include "voronoi.hpp"
@@ -13,9 +15,10 @@ static void usage(const char* argv0) {
         "Usage: " << argv0 << " <input.(obj|ply)> <output.obj>\n"
         "                  [--radius R]    minimum sample distance (default: auto)\n"
         "                  [--epsilon E]   displacement for inside/outside points\n"
-        "                                  (default: radius/10)\n"
+        "                                  (default: radius/20)\n"
         "                  [--seed S]      RNG seed (default: 42)\n"
         "                  [--points P]    pre-sampled points file (skips sampling)\n"
+        "                  [--threads T]   OpenMP thread count (default: all cores)\n"
         "\n"
         "Computes a Voronoi-based medial axis approximation from a closed surface\n"
         "mesh.  Writes the result as a polygon OBJ.\n"
@@ -36,6 +39,7 @@ int main(int argc, char** argv) {
     double radius  = -1.0;
     double epsilon = -1.0;
     unsigned int seed = 42;
+    int n_threads = omp_get_max_threads();
     std::string points_file;
 
     for (int i = 3; i < argc; i++) {
@@ -48,8 +52,12 @@ int main(int argc, char** argv) {
             seed = static_cast<unsigned>(std::stoul(argv[++i]));
         else if ((flag == "--points"  || flag == "-p") && i + 1 < argc)
             points_file = argv[++i];
+        else if ((flag == "--threads" || flag == "-j") && i + 1 < argc)
+            n_threads = std::stoi(argv[++i]);
         else { usage(argv[0]); return 1; }
     }
+
+    omp_set_num_threads(n_threads);
 
     try {
         SampledPoints pts;
@@ -97,7 +105,8 @@ int main(int argc, char** argv) {
             std::cerr << "  Auto epsilon: " << epsilon << "\n";
         }
 
-        std::cerr << "Computing medial axis (epsilon=" << epsilon << ") ...\n";
+        std::cerr << "Computing medial axis (epsilon=" << epsilon
+                  << ", threads=" << omp_get_max_threads() << ") ...\n";
         MedialAxisMesh ma = compute_medial_axis(pts, epsilon);
         std::cerr << "  " << ma.vertices.size() << " vertices, "
                   << ma.faces.size() << " faces\n";
