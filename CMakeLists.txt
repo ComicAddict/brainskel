@@ -15,6 +15,9 @@ set(CMAKE_CXX_FLAGS_DEBUG   "-g -O0 -fsanitize=address,undefined")
 # ---- OpenMP ----------------------------------------------------------------
 find_package(OpenMP REQUIRED)
 
+# ---- ZLIB ------------------------------------------------------------------
+find_package(ZLIB REQUIRED)
+
 # ---- voro++ ----------------------------------------------------------------
 # The upstream repo uses a Makefile, so we fetch and build manually.
 include(FetchContent)
@@ -44,7 +47,7 @@ add_library(brainskel_lib STATIC
   src/voronoi.cpp
 )
 target_include_directories(brainskel_lib PUBLIC include)
-target_link_libraries(brainskel_lib PUBLIC voro_lib OpenMP::OpenMP_CXX)
+target_link_libraries(brainskel_lib PUBLIC voro_lib OpenMP::OpenMP_CXX ZLIB::ZLIB)
 target_compile_options(brainskel_lib PRIVATE -Wall -Wextra)
 
 # ---- tools -----------------------------------------------------------------

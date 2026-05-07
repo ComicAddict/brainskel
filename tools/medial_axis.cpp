@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -59,18 +60,31 @@ int main(int argc, char** argv) {
 
     omp_set_num_threads(n_threads);
 
+    using Clock = std::chrono::steady_clock;
+    using Sec   = std::chrono::duration<double>;
+    auto elapsed = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration_cast<Sec>(b - a).count();
+    };
+
     try {
         SampledPoints pts;
+        double t_load = 0.0, t_sample = 0.0, t_compute = 0.0, t_write = 0.0;
+
+        auto t0 = Clock::now();
 
         if (!points_file.empty()) {
             std::cerr << "Loading pre-sampled points: " << points_file << " ...\n";
             pts = load_points(points_file);
-            std::cerr << "  " << pts.positions.size() << " points\n";
+            t_load = elapsed(t0, Clock::now());
+            std::cerr << "  " << pts.positions.size() << " points  ["
+                      << t_load << " s]\n";
         } else {
             std::cerr << "Loading mesh: " << input << " ...\n";
             Mesh mesh = load_mesh(input);
+            t_load = elapsed(t0, Clock::now());
             std::cerr << "  " << mesh.vertices.size() << " vertices, "
-                      << mesh.triangles.size() << " triangles\n";
+                      << mesh.triangles.size() << " triangles  ["
+                      << t_load << " s]\n";
 
             if (radius <= 0.0) {
                 double area = mesh.surface_area();
@@ -81,16 +95,17 @@ int main(int argc, char** argv) {
 
             std::cerr << "Sampling (min radius=" << radius
                       << ", seed=" << seed << ") ...\n";
+            auto ts = Clock::now();
             pts = poisson_disk_sample(mesh, radius, seed);
-            std::cerr << "  " << pts.positions.size() << " samples\n";
+            t_sample = elapsed(ts, Clock::now());
+            std::cerr << "  " << pts.positions.size() << " samples  ["
+                      << t_sample << " s]\n";
         }
 
         if (epsilon <= 0.0) {
-            // Epsilon should be small relative to sample spacing.
             if (radius > 0.0)
                 epsilon = radius * 0.05;
             else {
-                // Estimate from point cloud spread.
                 Vec3 bmin = pts.positions[0], bmax = pts.positions[0];
                 for (const auto& p : pts.positions) {
                     bmin.x = std::min(bmin.x, p.x); bmax.x = std::max(bmax.x, p.x);
@@ -107,12 +122,26 @@ int main(int argc, char** argv) {
 
         std::cerr << "Computing medial axis (epsilon=" << epsilon
                   << ", threads=" << omp_get_max_threads() << ") ...\n";
+        auto tc = Clock::now();
         MedialAxisMesh ma = compute_medial_axis(pts, epsilon);
+        t_compute = elapsed(tc, Clock::now());
         std::cerr << "  " << ma.vertices.size() << " vertices, "
-                  << ma.faces.size() << " faces\n";
+                  << ma.faces.size() << " faces  [" << t_compute << " s]\n";
 
         std::cerr << "Writing: " << output << " ...\n";
+        auto tw = Clock::now();
         save_obj_polygons(output, ma.vertices, ma.faces);
+        t_write = elapsed(tw, Clock::now());
+        std::cerr << "  [" << t_write << " s]\n";
+
+        double t_total = elapsed(t0, Clock::now());
+        std::cerr << "\nTiming summary:\n"
+                  << "  load    : " << t_load    << " s\n"
+                  << "  sample  : " << t_sample  << " s\n"
+                  << "  compute : " << t_compute << " s\n"
+                  << "  write   : " << t_write   << " s\n"
+                  << "  total   : " << t_total   << " s\n";
+
         std::cerr << "Done.\n";
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << '\n';

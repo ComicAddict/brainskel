@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <numeric>
@@ -10,6 +11,8 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <cstdint>
+#include <zlib.h>
 
 // ---------------------------------------------------------------------------
 // Normals
@@ -150,6 +153,208 @@ static Mesh load_ply(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
+// GIFTI loader (.gii)
+// Handles the three standard encodings: GZipBase64Binary, Base64Binary, ASCII.
+// Supported DataTypes: NIFTI_TYPE_FLOAT32, NIFTI_TYPE_FLOAT64 (coords)
+//                      NIFTI_TYPE_INT32 (triangles)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Base64 decode table, built once at startup.
+static const auto& b64_table() {
+    static const auto T = []() {
+        std::array<int, 256> t;
+        t.fill(-1);
+        for (int i = 0; i < 26; i++) { t['A' + i] = i;      t['a' + i] = 26 + i; }
+        for (int i = 0; i < 10; i++)   t['0' + i] = 52 + i;
+        t['+'] = 62; t['/'] = 63; t['='] = 0;
+        return t;
+    }();
+    return T;
+}
+
+static std::vector<uint8_t> base64_decode(const std::string& s) {
+    const auto& T = b64_table();
+    std::vector<uint8_t> out;
+    out.reserve(s.size() * 3 / 4);
+    int val = 0, bits = -8;
+    for (unsigned char c : s) {
+        if (T[c] < 0) continue;
+        val = (val << 6) + T[c];
+        bits += 6;
+        if (bits >= 0) { out.push_back((val >> bits) & 0xFF); bits -= 8; }
+    }
+    return out;
+}
+
+// Decompresses a zlib stream (the "GZipBase64Binary" GIFTI encoding is
+// actually zlib-deflate with the standard 0x78 header, not raw gzip).
+// inflateInit2 with windowBits = 47 auto-detects both zlib and gzip.
+static std::vector<uint8_t> zlib_inflate(const std::vector<uint8_t>& in) {
+    z_stream s{};
+    if (inflateInit2(&s, 47) != Z_OK)
+        throw std::runtime_error("zlib init failed");
+
+    s.avail_in  = static_cast<uInt>(in.size());
+    s.next_in   = const_cast<Bytef*>(in.data());
+
+    std::vector<uint8_t> out;
+    uint8_t buf[65536];
+    int ret;
+    do {
+        s.avail_out = sizeof(buf);
+        s.next_out  = buf;
+        ret = inflate(&s, Z_NO_FLUSH);
+        if (ret != Z_OK && ret != Z_STREAM_END)
+            { inflateEnd(&s); throw std::runtime_error("zlib inflate error"); }
+        out.insert(out.end(), buf, buf + sizeof(buf) - s.avail_out);
+    } while (ret != Z_STREAM_END);
+
+    inflateEnd(&s);
+    return out;
+}
+
+// Little/big-endian readers — GIFTI specifies the endianness per DataArray.
+static float    rd_f32(const uint8_t* p, bool be) {
+    uint32_t u = be
+        ? (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3]
+        :  uint32_t(p[0])     |(uint32_t(p[1])<<8) |(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24);
+    float f; std::memcpy(&f, &u, 4); return f;
+}
+static double   rd_f64(const uint8_t* p, bool be) {
+    uint64_t u = be
+        ? (uint64_t(p[0])<<56)|(uint64_t(p[1])<<48)|(uint64_t(p[2])<<40)|(uint64_t(p[3])<<32)
+         |(uint64_t(p[4])<<24)|(uint64_t(p[5])<<16)|(uint64_t(p[6])<<8) | p[7]
+        :  uint64_t(p[0])     |(uint64_t(p[1])<<8) |(uint64_t(p[2])<<16)|(uint64_t(p[3])<<24)
+         |(uint64_t(p[4])<<32)|(uint64_t(p[5])<<40)|(uint64_t(p[6])<<48)|(uint64_t(p[7])<<56);
+    double d; std::memcpy(&d, &u, 8); return d;
+}
+static int32_t  rd_i32(const uint8_t* p, bool be) {
+    uint32_t u = be
+        ? (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3]
+        :  uint32_t(p[0])     |(uint32_t(p[1])<<8) |(uint32_t(p[2])<<16)|(uint32_t(p[3])<<24);
+    int32_t i; std::memcpy(&i, &u, 4); return i;
+}
+
+// Extract the value of an XML attribute from a tag string, e.g.
+// attr(tag, "Intent") -> "NIFTI_INTENT_POINTSET"
+static std::string xml_attr(const std::string& tag, const std::string& name) {
+    auto pos = tag.find(name + "=\"");
+    if (pos == std::string::npos) return {};
+    pos += name.size() + 2;
+    auto end = tag.find('"', pos);
+    return end != std::string::npos ? tag.substr(pos, end - pos) : std::string{};
+}
+
+} // anonymous namespace
+
+static Mesh load_gifti(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("Cannot open: " + path);
+    std::string xml((std::istreambuf_iterator<char>(f)), {});
+
+    Mesh m;
+
+    size_t pos = 0;
+    while (true) {
+        size_t arr = xml.find("<DataArray", pos);
+        if (arr == std::string::npos) break;
+
+        size_t gt = xml.find('>', arr);
+        if (gt == std::string::npos) break;
+        const std::string tag = xml.substr(arr, gt - arr);
+
+        const std::string intent = xml_attr(tag, "Intent");
+        const std::string dtype  = xml_attr(tag, "DataType");
+        const std::string enc    = xml_attr(tag, "Encoding");
+        const bool big_endian    = (xml_attr(tag, "Endian") == "BigEndian");
+        const int dim0 = std::stoi(xml_attr(tag, "Dim0"));
+        const int dim1 = std::stoi(xml_attr(tag, "Dim1"));
+
+        // Locate <Data>...</Data> within this DataArray block (before next one).
+        size_t next_arr  = xml.find("<DataArray", gt + 1);
+        size_t data_open = xml.find("<Data>",     gt + 1);
+        if (data_open == std::string::npos ||
+            (next_arr != std::string::npos && data_open > next_arr)) {
+            pos = gt + 1;
+            continue;
+        }
+        data_open += 6;  // skip "<Data>"
+        size_t data_close = xml.find("</Data>", data_open);
+        if (data_close == std::string::npos) break;
+
+        // Decode the raw bytes.
+        std::vector<uint8_t> bytes;
+
+        if (enc == "GZipBase64Binary" || enc == "Base64Binary") {
+            std::string b64;
+            b64.reserve(data_close - data_open);
+            for (size_t i = data_open; i < data_close; i++)
+                if (!std::isspace(static_cast<unsigned char>(xml[i])))
+                    b64 += xml[i];
+            bytes = base64_decode(b64);
+            if (enc == "GZipBase64Binary")
+                bytes = zlib_inflate(bytes);
+        } else if (enc == "ASCII") {
+            // Tokenise and convert to binary on the fly via the numeric paths below.
+            // We set bytes empty and handle ASCII as a special case.
+        } else {
+            throw std::runtime_error("Unsupported GIFTI encoding: " + enc);
+        }
+
+        // ---- NIFTI_INTENT_POINTSET → vertex coordinates ----
+        if (intent == "NIFTI_INTENT_POINTSET") {
+            m.vertices.reserve(m.vertices.size() + dim0);
+            if (enc == "ASCII") {
+                std::istringstream ss(xml.substr(data_open, data_close - data_open));
+                for (int i = 0; i < dim0; i++) {
+                    Vec3 v{};
+                    ss >> v.x >> v.y >> v.z;
+                    m.vertices.push_back(v);
+                }
+            } else {
+                const bool f64 = (dtype == "NIFTI_TYPE_FLOAT64");
+                const int bpv  = f64 ? 8 : 4;
+                for (int i = 0; i < dim0; i++) {
+                    const uint8_t* p = bytes.data() + i * dim1 * bpv;
+                    m.vertices.push_back(f64
+                        ? Vec3{rd_f64(p,big_endian), rd_f64(p+8,big_endian), rd_f64(p+16,big_endian)}
+                        : Vec3{rd_f32(p,big_endian), rd_f32(p+4,big_endian), rd_f32(p+8,big_endian)});
+                }
+            }
+
+        // ---- NIFTI_INTENT_TRIANGLE → triangle connectivity ----
+        } else if (intent == "NIFTI_INTENT_TRIANGLE") {
+            m.triangles.reserve(m.triangles.size() + dim0);
+            if (enc == "ASCII") {
+                std::istringstream ss(xml.substr(data_open, data_close - data_open));
+                for (int i = 0; i < dim0; i++) {
+                    std::array<int,3> tri{};
+                    ss >> tri[0] >> tri[1] >> tri[2];
+                    m.triangles.push_back(tri);
+                }
+            } else {
+                for (int i = 0; i < dim0; i++) {
+                    const uint8_t* p = bytes.data() + i * 3 * 4;
+                    m.triangles.push_back(std::array<int,3>{rd_i32(p,big_endian), rd_i32(p+4,big_endian), rd_i32(p+8,big_endian)});
+                }
+            }
+        }
+
+        pos = data_close + 7;
+    }
+
+    if (m.vertices.empty())
+        throw std::runtime_error("No vertex data found in GIFTI: " + path);
+    if (m.triangles.empty())
+        throw std::runtime_error("No triangle data found in GIFTI: " + path);
+
+    m.compute_vertex_normals();
+    return m;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -162,6 +367,7 @@ Mesh load_mesh(const std::string& path) {
 
     if (ext == "obj") return load_obj(path);
     if (ext == "ply") return load_ply(path);
+    if (ext == "gii") return load_gifti(path);
     throw std::runtime_error("Unsupported mesh format: " + ext);
 }
 
