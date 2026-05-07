@@ -1,10 +1,15 @@
 #include "mesh.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
+#include <map>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 
 // ---------------------------------------------------------------------------
 // Normals
@@ -158,6 +163,86 @@ Mesh load_mesh(const std::string& path) {
     if (ext == "obj") return load_obj(path);
     if (ext == "ply") return load_ply(path);
     throw std::runtime_error("Unsupported mesh format: " + ext);
+}
+
+// ---------------------------------------------------------------------------
+// weld_vertices
+// ---------------------------------------------------------------------------
+
+void weld_vertices(std::vector<Vec3>& vertices,
+                   std::vector<std::vector<int>>& faces,
+                   double tol) {
+    int N = static_cast<int>(vertices.size());
+    if (N == 0) return;
+
+    // Grid cell = tol.  Each vertex is looked up in a 3×3×3 neighbourhood
+    // of cells so bin-boundary artefacts are impossible.
+    double tol2 = tol * tol;
+
+    Vec3 bmin = vertices[0];
+    for (const auto& v : vertices) {
+        bmin.x = std::min(bmin.x, v.x);
+        bmin.y = std::min(bmin.y, v.y);
+        bmin.z = std::min(bmin.z, v.z);
+    }
+
+    using Key = std::tuple<long long, long long, long long>;
+    auto make_key = [&](const Vec3& v, long long dx = 0, long long dy = 0, long long dz = 0) {
+        return Key{
+            static_cast<long long>(std::floor((v.x - bmin.x) / tol)) + dx,
+            static_cast<long long>(std::floor((v.y - bmin.y) / tol)) + dy,
+            static_cast<long long>(std::floor((v.z - bmin.z) / tol)) + dz
+        };
+    };
+
+    // Grid maps a cell key to a list of representative vertex indices
+    // (in new_verts).  Multiple representatives per cell are rare but
+    // handled correctly.
+    std::map<Key, std::vector<int>> grid;
+
+    std::vector<int>  remap(N, -1);
+    std::vector<Vec3> new_verts;
+    new_verts.reserve(N);
+
+    for (int i = 0; i < N; i++) {
+        const Vec3& p = vertices[i];
+        auto [kx, ky, kz] = make_key(p);
+
+        int found = -1;
+        for (long long dx = -1; dx <= 1 && found < 0; dx++)
+        for (long long dy = -1; dy <= 1 && found < 0; dy++)
+        for (long long dz = -1; dz <= 1 && found < 0; dz++) {
+            auto it = grid.find({kx + dx, ky + dy, kz + dz});
+            if (it == grid.end()) continue;
+            for (int j : it->second) {
+                Vec3 d = p - new_verts[j];
+                if (d.dot(d) <= tol2) { found = j; break; }
+            }
+        }
+
+        if (found >= 0) {
+            remap[i] = found;
+        } else {
+            remap[i] = static_cast<int>(new_verts.size());
+            grid[{kx, ky, kz}].push_back(remap[i]);
+            new_verts.push_back(p);
+        }
+    }
+
+    vertices = std::move(new_verts);
+
+    // Remap face indices and remove faces that become degenerate.
+    for (auto& face : faces) {
+        for (int& idx : face) idx = remap[idx];
+        // Remove consecutive duplicates (handles the wrapped edge too).
+        face.erase(std::unique(face.begin(), face.end()), face.end());
+        if (face.size() >= 2 && face.front() == face.back())
+            face.pop_back();
+    }
+    faces.erase(
+        std::remove_if(faces.begin(), faces.end(),
+                       [](const std::vector<int>& f) { return f.size() < 3; }),
+        faces.end());
 }
 
 void save_obj_polygons(const std::string& path,

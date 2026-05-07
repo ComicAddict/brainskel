@@ -43,3 +43,10 @@ Mesh load_mesh(const std::string& path);
 void save_obj_polygons(const std::string& path,
                        const std::vector<Vec3>& vertices,
                        const std::vector<std::vector<int>>& faces);
+
+// Merge vertices whose Euclidean distance is <= tol, update face indices,
+// and remove any faces that become degenerate (< 3 distinct vertices).
+// Uses a spatial grid so complexity is O(N) in the common case.
+void weld_vertices(std::vector<Vec3>& vertices,
+                   std::vector<std::vector<int>>& faces,
+                   double tol);

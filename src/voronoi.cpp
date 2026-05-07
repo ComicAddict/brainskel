@@ -2,35 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
-#include <map>
+#include <numeric>
 #include <stdexcept>
-#include <tuple>
 
+#include "mesh.hpp"
 #include "voro++.hh"
-
-// ---------------------------------------------------------------------------
-// Vertex deduplication via coordinate rounding.
-// ---------------------------------------------------------------------------
-
-struct VertexTable {
-    // Round to 9 decimal places so that mathematically identical Voronoi
-    // vertices computed from adjacent cells map to the same index.
-    static constexpr double SCALE = 1e9;
-
-    std::map<std::tuple<long long, long long, long long>, int> map;
-    std::vector<Vec3>& out;
-
-    explicit VertexTable(std::vector<Vec3>& v) : out(v) {}
-
-    int get_or_insert(double x, double y, double z) {
-        auto key = std::make_tuple(llround(x * SCALE),
-                                   llround(y * SCALE),
-                                   llround(z * SCALE));
-        auto [it, inserted] = map.emplace(key, static_cast<int>(out.size()));
-        if (inserted) out.push_back({x, y, z});
-        return it->second;
-    }
-};
 
 // ---------------------------------------------------------------------------
 // compute_medial_axis
@@ -55,7 +31,8 @@ MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon) {
         bmin.y = std::min(bmin.y, p.y); bmax.y = std::max(bmax.y, p.y);
         bmin.z = std::min(bmin.z, p.z); bmax.z = std::max(bmax.z, p.z);
     }
-    double pad = std::max({bmax.x - bmin.x, bmax.y - bmin.y, bmax.z - bmin.z}) * 0.02;
+    double extent = std::max({bmax.x - bmin.x, bmax.y - bmin.y, bmax.z - bmin.z});
+    double pad    = extent * 0.02;
     bmin.x -= pad; bmin.y -= pad; bmin.z -= pad;
     bmax.x += pad; bmax.y += pad; bmax.z += pad;
 
@@ -78,9 +55,10 @@ MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon) {
     for (int i = 0; i < n_total; i++)
         con.put(i, all[i].x, all[i].y, all[i].z);
 
-    // Collect qualifying Voronoi faces.
+    // Collect qualifying Voronoi faces as a raw vertex soup.  The same
+    // geometric vertex will appear once per adjacent cell with minutely
+    // different floating-point values; weld_vertices() fuses them afterward.
     MedialAxisMesh result;
-    VertexTable vtable(result.vertices);
 
     voro::c_loop_all vl(con);
     voro::voronoicell_neighbor vc;
@@ -96,7 +74,7 @@ MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon) {
         double cx = vl.x(), cy = vl.y(), cz = vl.z();
 
         std::vector<int> neigh;
-        vc.neighbors(neigh);   // one entry per face
+        vc.neighbors(neigh);  // one entry per face
 
         std::vector<double> v;
         vc.vertices(cx, cy, cz, v);  // absolute positions, flat [x0,y0,z0,...]
@@ -109,22 +87,32 @@ MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon) {
             int n_verts = fv[fi++];
             int nb = neigh[f];
 
-            // Keep only faces shared between two inside points; deduplicate by
-            // only recording the face from the cell with the smaller ID.
+            // Keep faces shared by two inside points.
+            // Record only from the cell with the smaller ID to avoid duplicates.
             if (nb >= 0 && nb < N && id < nb) {
-                std::vector<int> face_idx;
-                face_idx.reserve(n_verts);
+                int base = static_cast<int>(result.vertices.size());
                 for (int k = 0; k < n_verts; k++) {
                     int vi = fv[fi + k];
-                    face_idx.push_back(
-                        vtable.get_or_insert(v[3 * vi], v[3 * vi + 1], v[3 * vi + 2]));
+                    result.vertices.push_back({v[3*vi], v[3*vi+1], v[3*vi+2]});
                 }
+                std::vector<int> face_idx(n_verts);
+                std::iota(face_idx.begin(), face_idx.end(), base);
                 result.faces.push_back(std::move(face_idx));
             }
 
             fi += n_verts;
         }
     } while (vl.inc());
+
+    // Weld: merge vertices within a tolerance that absorbs the floating-point
+    // differences between adjacent cells, while staying far below any real
+    // geometric feature.  1e-7 * extent is ~10^7 x larger than double-precision
+    // noise yet ~10^5 x smaller than the minimum Voronoi edge for typical inputs.
+    // Tolerance: large enough to absorb inter-cell fp disagreement on the same
+    // Voronoi vertex (~1e-10 for brain-scale coords), far smaller than any
+    // real Voronoi edge (typically >> epsilon).
+    double weld_tol = std::max(extent * 1e-7, 1e-12);
+    weld_vertices(result.vertices, result.faces, weld_tol);
 
     return result;
 }
