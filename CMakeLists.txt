@@ -51,10 +51,10 @@ target_link_libraries(brainskel_lib PUBLIC voro_lib OpenMP::OpenMP_CXX ZLIB::ZLI
 target_compile_options(brainskel_lib PRIVATE -Wall -Wextra)
 
 # ---- tools -----------------------------------------------------------------
-foreach(tool sample_points medial_axis)
+foreach(tool sample_points medial_axis betti)
   add_executable(${tool} tools/${tool}.cpp)
   target_link_libraries(${tool} PRIVATE brainskel_lib)
 endforeach()
 
 # ---- install ---------------------------------------------------------------
-install(TARGETS sample_points medial_axis DESTINATION bin)
+install(TARGETS sample_points medial_axis betti DESTINATION bin)
