@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <vector>
@@ -160,4 +161,33 @@ MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon) {
     weld_vertices(result.vertices, result.faces, weld_tol);
 
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// compute_medial_radii
+// ---------------------------------------------------------------------------
+
+std::vector<float> compute_medial_radii(const std::vector<Vec3>& ma_verts,
+                                        const SampledPoints& pts) {
+    int M = static_cast<int>(ma_verts.size());
+    int N = static_cast<int>(pts.positions.size());
+    std::vector<float> radii(M, 0.0f);
+    if (M == 0 || N == 0) return radii;
+
+    #pragma omp parallel for schedule(dynamic, 64) \
+        default(none) shared(ma_verts, pts, radii, M, N)
+    for (int i = 0; i < M; i++) {
+        const Vec3& v = ma_verts[i];
+        double best = std::numeric_limits<double>::max();
+        for (int j = 0; j < N; j++) {
+            const Vec3& p = pts.positions[j];
+            double dx = v.x - p.x;
+            double dy = v.y - p.y;
+            double dz = v.z - p.z;
+            double d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 < best) best = d2;
+        }
+        radii[i] = static_cast<float>(std::sqrt(best));
+    }
+    return radii;
 }

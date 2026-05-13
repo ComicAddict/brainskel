@@ -46,10 +46,13 @@ void save_obj_polygons(const std::string& path,
 
 // Write a polygon soup as PLY.  binary=true → binary_little_endian (default).
 // Vertex coords stored as float32; face indices as int32 with uint8 count.
+// If radii is non-empty it must match vertices.size(); a "property float radius"
+// is appended to each vertex record.
 void save_ply_polygons(const std::string& path,
                        const std::vector<Vec3>& vertices,
                        const std::vector<std::vector<int>>& faces,
-                       bool binary = true);
+                       bool binary = true,
+                       const std::vector<float>& radii = {});
 
 // Merge vertices whose Euclidean distance is <= tol, update face indices,
 // and remove any faces that become degenerate (< 3 distinct vertices).

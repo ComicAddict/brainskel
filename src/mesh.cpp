@@ -646,7 +646,10 @@ void save_obj_polygons(const std::string& path,
 void save_ply_polygons(const std::string& path,
                        const std::vector<Vec3>& vertices,
                        const std::vector<std::vector<int>>& faces,
-                       bool binary) {
+                       bool binary,
+                       const std::vector<float>& radii) {
+    bool has_radii = !radii.empty();
+
     auto mode = binary ? (std::ios::binary | std::ios::out) : std::ios::out;
     std::ofstream f(path, mode);
     if (!f) throw std::runtime_error("Cannot write: " + path);
@@ -657,17 +660,21 @@ void save_ply_polygons(const std::string& path,
       << "element vertex " << vertices.size() << "\n"
       << "property float x\n"
       << "property float y\n"
-      << "property float z\n"
-      << "element face " << faces.size() << "\n"
+      << "property float z\n";
+    if (has_radii)
+        f << "property float radius\n";
+    f << "element face " << faces.size() << "\n"
       << "property list uchar int vertex_indices\n"
       << "end_header\n";
 
     if (binary) {
-        for (auto& v : vertices) {
-            float xyz[3] = {static_cast<float>(v.x),
-                            static_cast<float>(v.y),
-                            static_cast<float>(v.z)};
+        for (size_t i = 0; i < vertices.size(); i++) {
+            float xyz[3] = {static_cast<float>(vertices[i].x),
+                            static_cast<float>(vertices[i].y),
+                            static_cast<float>(vertices[i].z)};
             f.write(reinterpret_cast<const char*>(xyz), 12);
+            if (has_radii)
+                f.write(reinterpret_cast<const char*>(&radii[i]), 4);
         }
         for (auto& face : faces) {
             uint8_t cnt = static_cast<uint8_t>(face.size());
@@ -679,8 +686,11 @@ void save_ply_polygons(const std::string& path,
         }
     } else {
         f.precision(7);
-        for (auto& v : vertices)
-            f << v.x << ' ' << v.y << ' ' << v.z << '\n';
+        for (size_t i = 0; i < vertices.size(); i++) {
+            f << vertices[i].x << ' ' << vertices[i].y << ' ' << vertices[i].z;
+            if (has_radii) f << ' ' << radii[i];
+            f << '\n';
+        }
         for (auto& face : faces) {
             f << face.size();
             for (int idx : face) f << ' ' << idx;

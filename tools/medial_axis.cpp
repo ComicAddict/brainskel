@@ -22,6 +22,9 @@ static void usage(const char* argv0) {
         "                  [--threads T]   OpenMP thread count (default: all cores)\n"
         "                  [--ascii]       write ASCII PLY when output is .ply\n"
         "                                  (default: binary_little_endian)\n"
+        "                  [--radii]       attach per-vertex medial radius attribute\n"
+        "                                  (distance to nearest surface sample);\n"
+        "                                  only valid when output is .ply\n"
         "\n"
         "Computes a Voronoi-based medial axis approximation from a closed surface\n"
         "mesh.  Output format is determined by the output file extension:\n"
@@ -47,6 +50,7 @@ int main(int argc, char** argv) {
     int n_threads = omp_get_max_threads();
     std::string points_file;
     bool ascii_ply = false;
+    bool export_radii = false;
 
     for (int i = 3; i < argc; i++) {
         std::string flag = argv[i];
@@ -62,6 +66,8 @@ int main(int argc, char** argv) {
             n_threads = std::stoi(argv[++i]);
         else if (flag == "--ascii")
             ascii_ply = true;
+        else if (flag == "--radii")
+            export_radii = true;
         else { usage(argv[0]); return 1; }
     }
 
@@ -73,6 +79,11 @@ int main(int argc, char** argv) {
         for (auto& c : e) c = static_cast<char>(std::tolower(c));
         return e;
     }();
+
+    if (export_radii && out_ext != "ply") {
+        std::cerr << "Error: --radii is only supported with .ply output\n";
+        return 1;
+    }
 
     omp_set_num_threads(n_threads);
 
@@ -144,12 +155,22 @@ int main(int argc, char** argv) {
         std::cerr << "  " << ma.vertices.size() << " vertices, "
                   << ma.faces.size() << " faces  [" << t_compute << " s]\n";
 
+        std::vector<float> radii;
+        if (export_radii) {
+            std::cerr << "Computing medial radii ...\n";
+            auto tr = Clock::now();
+            radii = compute_medial_radii(ma.vertices, pts);
+            std::cerr << "  [" << elapsed(tr, Clock::now()) << " s]\n";
+        }
+
         std::cerr << "Writing: " << output;
         auto tw = Clock::now();
         if (out_ext == "ply") {
             bool bin = !ascii_ply;
-            std::cerr << " (" << (bin ? "binary" : "ascii") << " PLY) ...\n";
-            save_ply_polygons(output, ma.vertices, ma.faces, bin);
+            std::cerr << " (" << (bin ? "binary" : "ascii") << " PLY";
+            if (export_radii) std::cerr << ", with radii";
+            std::cerr << ") ...\n";
+            save_ply_polygons(output, ma.vertices, ma.faces, bin, radii);
         } else {
             std::cerr << " (OBJ) ...\n";
             save_obj_polygons(output, ma.vertices, ma.faces);

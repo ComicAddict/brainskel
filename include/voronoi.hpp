@@ -21,3 +21,10 @@ struct MedialAxisMesh {
 // epsilon: displacement magnitude — should be much smaller than min_radius
 //          used during sampling (e.g. min_radius / 10).
 MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon);
+
+// For each vertex of the medial axis mesh, return its distance to the nearest
+// original surface sample point (pts.positions).  This approximates the local
+// feature size — the radius of the maximal inscribed sphere at that point.
+// Parallelised with OpenMP; complexity O(V_ma × N_samples / threads).
+std::vector<float> compute_medial_radii(const std::vector<Vec3>& ma_vertices,
+                                        const SampledPoints& pts);
