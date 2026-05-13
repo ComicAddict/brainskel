@@ -16,7 +16,8 @@
 // compute_medial_axis
 // ---------------------------------------------------------------------------
 
-MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon) {
+MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon,
+                                   bool merge_duplicates) {
     int N = static_cast<int>(pts.positions.size());
     if (N == 0) throw std::runtime_error("No input points.");
 
@@ -122,9 +123,22 @@ MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon) {
                 int n_verts = fv[fi++];
                 int nb = neigh[f];
 
-                // Keep only faces between two inside-displaced points;
-                // record from the cell with the smaller ID to avoid duplicates.
-                if (nb >= 0 && nb < N && pi.id < nb) {
+                // Outer cells are skipped at the top, so pi.id is always an
+                // inside-displaced point (pi.id ∈ [0, N)).  Decide per face:
+                //   inner–inner   keep, but record once (smaller id wins)
+                //   inner–outer   keep unless nb is the *same sample's* outer
+                //                 point (id == pi.id + N) — that's the "fake"
+                //                 bisector right at the original surface
+                //   bbox (nb<0)   skip
+                bool keep = false;
+                if (nb >= 0) {
+                    if (nb < N) {
+                        keep = (pi.id < nb);              // inner–inner
+                    } else {
+                        keep = (nb - N != pi.id);         // inner–outer
+                    }
+                }
+                if (keep) {
                     int base = static_cast<int>(local.vertices.size());
                     for (int k = 0; k < n_verts; k++) {
                         int vi = fv[fi + k];
@@ -154,11 +168,13 @@ MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon) {
         }
     }
 
-    // ---- Weld near-duplicate vertices ------------------------------------
+    // ---- Weld near-duplicate vertices (optional) -------------------------
     // Tolerance absorbs inter-cell floating-point disagreement while staying
     // far below any real Voronoi edge length.
-    double weld_tol = std::max(extent * 1e-7, 1e-12);
-    weld_vertices(result.vertices, result.faces, weld_tol);
+    if (merge_duplicates) {
+        double weld_tol = std::max(extent * 1e-7, 1e-12);
+        weld_vertices(result.vertices, result.faces, weld_tol);
+    }
 
     return result;
 }

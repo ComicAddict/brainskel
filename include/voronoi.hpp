@@ -13,14 +13,23 @@ struct MedialAxisMesh {
 // Algorithm:
 //   Each surface sample is displaced by `epsilon` along its normal to produce
 //   an "inside" point (inward) and an "outside" point (outward).  A 3-D
-//   Voronoi tessellation is computed over all 2*N displaced points.  Any
-//   Voronoi face whose two generating points are both "inside" points is kept
-//   as part of the medial axis; faces touching an "outside" point are
-//   discarded.
+//   Voronoi tessellation is computed over all 2*N displaced points.  For
+//   each Voronoi face we apply the following keep/remove rule based on the
+//   two generating points:
+//     inner – inner                                 → KEEP
+//     outer – outer                                 → REMOVE
+//     same-sample inner / outer (perpendicular
+//       bisector lying right at the surface)        → REMOVE
+//     inner / outer from *different* samples        → KEEP
 //
 // epsilon: displacement magnitude — should be much smaller than min_radius
-//          used during sampling (e.g. min_radius / 10).
-MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon);
+//          used during sampling (e.g. min_radius / 20).
+// merge_duplicates: if true (default), weld near-coincident Voronoi vertices
+//          that were independently computed in neighbouring cells, producing
+//          a connected mesh.  Set to false to keep the raw per-face vertex
+//          soup (useful for debugging or for downstream tools that prefer it).
+MedialAxisMesh compute_medial_axis(const SampledPoints& pts, double epsilon,
+                                   bool merge_duplicates = true);
 
 // For each vertex of the medial axis mesh, return its distance to the nearest
 // original surface sample point (pts.positions).  This approximates the local

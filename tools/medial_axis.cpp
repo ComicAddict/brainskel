@@ -25,6 +25,8 @@ static void usage(const char* argv0) {
         "                  [--radii]       attach per-vertex medial radius attribute\n"
         "                                  (distance to nearest surface sample);\n"
         "                                  only valid when output is .ply\n"
+        "                  [--no-merge]    skip welding of duplicate vertices\n"
+        "                                  (output keeps raw per-face vertex soup)\n"
         "\n"
         "Computes a Voronoi-based medial axis approximation from a closed surface\n"
         "mesh.  Output format is determined by the output file extension:\n"
@@ -51,6 +53,7 @@ int main(int argc, char** argv) {
     std::string points_file;
     bool ascii_ply = false;
     bool export_radii = false;
+    bool merge_duplicates = true;
 
     for (int i = 3; i < argc; i++) {
         std::string flag = argv[i];
@@ -68,6 +71,8 @@ int main(int argc, char** argv) {
             ascii_ply = true;
         else if (flag == "--radii")
             export_radii = true;
+        else if (flag == "--no-merge")
+            merge_duplicates = false;
         else { usage(argv[0]); return 1; }
     }
 
@@ -157,7 +162,7 @@ int main(int argc, char** argv) {
         std::cerr << "Computing medial axis (epsilon=" << epsilon
                   << ", threads=" << omp_get_max_threads() << ") ...\n";
         auto tc = Clock::now();
-        MedialAxisMesh ma = compute_medial_axis(pts, epsilon);
+        MedialAxisMesh ma = compute_medial_axis(pts, epsilon, merge_duplicates);
         t_compute = elapsed(tc, Clock::now());
         std::cerr << "  " << ma.vertices.size() << " vertices, "
                   << ma.faces.size() << " faces  [" << t_compute << " s]\n";
