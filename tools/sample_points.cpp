@@ -8,9 +8,10 @@
 
 static void usage(const char* argv0) {
     std::cerr <<
-        "Usage: " << argv0 << " <input.(obj|ply)> <output.ply>\n"
+        "Usage: " << argv0 << " <input.(obj|ply|gii)> <output.ply>\n"
         "                   [--radius R]   minimum sample distance (default: auto)\n"
         "                   [--seed S]     RNG seed (default: 42)\n"
+        "                   [--ascii]      write ASCII PLY (default: binary)\n"
         "\n"
         "Samples points on the mesh surface using Poisson-disk sampling.\n"
         "Output is a PLY point cloud (x y z nx ny nz) importable in Blender.\n";
@@ -24,6 +25,7 @@ int main(int argc, char** argv) {
 
     double radius = -1.0;
     unsigned int seed = 42;
+    bool binary = true;
 
     for (int i = 3; i < argc; i++) {
         std::string flag = argv[i];
@@ -31,6 +33,8 @@ int main(int argc, char** argv) {
             radius = std::stod(argv[++i]);
         else if ((flag == "--seed" || flag == "-s") && i + 1 < argc)
             seed = static_cast<unsigned>(std::stoul(argv[++i]));
+        else if (flag == "--ascii")
+            binary = false;
         else { usage(argv[0]); return 1; }
     }
 
@@ -41,7 +45,6 @@ int main(int argc, char** argv) {
                   << mesh.triangles.size() << " triangles\n";
 
         if (radius <= 0.0) {
-            // Default: target ~10 000 samples.
             double area = mesh.surface_area();
             radius = std::sqrt(area / (M_PI * 10000.0 / 4.0));
             std::cerr << "  Auto radius: " << radius
@@ -53,8 +56,9 @@ int main(int argc, char** argv) {
         SampledPoints pts = poisson_disk_sample(mesh, radius, seed);
         std::cerr << "  " << pts.positions.size() << " samples\n";
 
-        std::cerr << "Writing: " << output << " ...\n";
-        save_points(output, pts);
+        std::cerr << "Writing: " << output
+                  << " (" << (binary ? "binary" : "ascii") << " PLY) ...\n";
+        save_points(output, pts, binary);
         std::cerr << "Done.\n";
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << '\n';

@@ -13,16 +13,20 @@
 
 static void usage(const char* argv0) {
     std::cerr <<
-        "Usage: " << argv0 << " <input.(obj|ply)> <output.obj>\n"
+        "Usage: " << argv0 << " <input.(obj|ply|gii)> <output.(obj|ply)>\n"
         "                  [--radius R]    minimum sample distance (default: auto)\n"
         "                  [--epsilon E]   displacement for inside/outside points\n"
         "                                  (default: radius/20)\n"
         "                  [--seed S]      RNG seed (default: 42)\n"
         "                  [--points P]    pre-sampled points file (skips sampling)\n"
         "                  [--threads T]   OpenMP thread count (default: all cores)\n"
+        "                  [--ascii]       write ASCII PLY when output is .ply\n"
+        "                                  (default: binary_little_endian)\n"
         "\n"
         "Computes a Voronoi-based medial axis approximation from a closed surface\n"
-        "mesh.  Writes the result as a polygon OBJ.\n"
+        "mesh.  Output format is determined by the output file extension:\n"
+        "  .obj  → Wavefront OBJ polygon mesh\n"
+        "  .ply  → PLY polygon mesh (binary by default; --ascii to override)\n"
         "\n"
         "Pipeline:\n"
         "  1. Poisson-disk sample the surface.\n"
@@ -42,6 +46,7 @@ int main(int argc, char** argv) {
     unsigned int seed = 42;
     int n_threads = omp_get_max_threads();
     std::string points_file;
+    bool ascii_ply = false;
 
     for (int i = 3; i < argc; i++) {
         std::string flag = argv[i];
@@ -55,8 +60,19 @@ int main(int argc, char** argv) {
             points_file = argv[++i];
         else if ((flag == "--threads" || flag == "-j") && i + 1 < argc)
             n_threads = std::stoi(argv[++i]);
+        else if (flag == "--ascii")
+            ascii_ply = true;
         else { usage(argv[0]); return 1; }
     }
+
+    // Determine output format from extension.
+    auto out_ext = [&]() {
+        auto dot = output.rfind('.');
+        if (dot == std::string::npos) return std::string{};
+        std::string e = output.substr(dot + 1);
+        for (auto& c : e) c = static_cast<char>(std::tolower(c));
+        return e;
+    }();
 
     omp_set_num_threads(n_threads);
 
@@ -128,9 +144,16 @@ int main(int argc, char** argv) {
         std::cerr << "  " << ma.vertices.size() << " vertices, "
                   << ma.faces.size() << " faces  [" << t_compute << " s]\n";
 
-        std::cerr << "Writing: " << output << " ...\n";
+        std::cerr << "Writing: " << output;
         auto tw = Clock::now();
-        save_obj_polygons(output, ma.vertices, ma.faces);
+        if (out_ext == "ply") {
+            bool bin = !ascii_ply;
+            std::cerr << " (" << (bin ? "binary" : "ascii") << " PLY) ...\n";
+            save_ply_polygons(output, ma.vertices, ma.faces, bin);
+        } else {
+            std::cerr << " (OBJ) ...\n";
+            save_obj_polygons(output, ma.vertices, ma.faces);
+        }
         t_write = elapsed(tw, Clock::now());
         std::cerr << "  [" << t_write << " s]\n";
 

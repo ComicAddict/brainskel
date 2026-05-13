@@ -91,61 +91,235 @@ static Mesh load_obj(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
-// PLY loader (ASCII only)
+// PLY helpers — type sizing and binary scalar reading
+// ---------------------------------------------------------------------------
+
+static int ply_type_size(const std::string& t) {
+    if (t=="char"||t=="int8"||t=="uchar"||t=="uint8") return 1;
+    if (t=="short"||t=="int16"||t=="ushort"||t=="uint16") return 2;
+    if (t=="int"||t=="int32"||t=="uint"||t=="uint32"||
+        t=="float"||t=="float32") return 4;
+    if (t=="double"||t=="float64"||t=="int64"||t=="uint64") return 8;
+    return 0;
+}
+
+static double read_ply_scalar(const char* buf, const std::string& type, bool be) {
+    if (type=="float"||type=="float32") {
+        uint32_t u; memcpy(&u,buf,4);
+        if (be) u=__builtin_bswap32(u);
+        float v; memcpy(&v,&u,4); return v;
+    }
+    if (type=="double"||type=="float64") {
+        uint64_t u; memcpy(&u,buf,8);
+        if (be) u=__builtin_bswap64(u);
+        double v; memcpy(&v,&u,8); return v;
+    }
+    if (type=="int"||type=="int32") {
+        uint32_t u; memcpy(&u,buf,4);
+        if (be) u=__builtin_bswap32(u);
+        return static_cast<int32_t>(u);
+    }
+    if (type=="uint"||type=="uint32") {
+        uint32_t u; memcpy(&u,buf,4);
+        if (be) u=__builtin_bswap32(u);
+        return u;
+    }
+    if (type=="short"||type=="int16") {
+        uint16_t u; memcpy(&u,buf,2);
+        if (be) u=__builtin_bswap16(u);
+        return static_cast<int16_t>(u);
+    }
+    if (type=="ushort"||type=="uint16") {
+        uint16_t u; memcpy(&u,buf,2);
+        if (be) u=__builtin_bswap16(u);
+        return u;
+    }
+    if (type=="char"||type=="int8")  return static_cast<int8_t>(buf[0]);
+    if (type=="uchar"||type=="uint8") return static_cast<uint8_t>(buf[0]);
+    return 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// PLY loader (ASCII and binary little/big endian)
 // ---------------------------------------------------------------------------
 
 static Mesh load_ply(const std::string& path) {
-    std::ifstream f(path);
+    // Open in binary mode so tellg() is accurate and read() works for binary PLY.
+    std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open: " + path);
 
-    std::string line;
-    int n_verts = 0, n_faces = 0;
-    bool header = true;
-    bool binary = false;
+    // ---- Parse header (always ASCII text) ----------------------------------
+    struct Prop {
+        std::string name, type;
+        int size;
+        bool is_list{false};
+        std::string list_cnt_type, list_val_type;
+        int list_cnt_size{0}, list_val_size{0};
+    };
+    struct Elem {
+        std::string name;
+        int count{0};
+        std::vector<Prop> props;
+        int stride{0};  // 0 if any prop is a list
+    };
 
-    while (header && std::getline(f, line)) {
+    enum class Fmt { ASCII, LE, BE } fmt = Fmt::ASCII;
+    std::vector<Elem> elements;
+    Elem* cur = nullptr;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         std::istringstream ss(line);
-        std::string tok;
-        ss >> tok;
+        std::string tok; ss >> tok;
+        if (tok == "ply" || tok == "comment" || tok == "obj_info") continue;
         if (tok == "format") {
-            std::string fmt; ss >> fmt;
-            if (fmt != "ascii") {
-                binary = true;
-            }
+            std::string s; ss >> s;
+            if (s == "binary_little_endian") fmt = Fmt::LE;
+            else if (s == "binary_big_endian") fmt = Fmt::BE;
         } else if (tok == "element") {
-            std::string name; int count;
-            ss >> name >> count;
-            if (name == "vertex") n_verts = count;
-            else if (name == "face") n_faces = count;
+            elements.push_back({});
+            cur = &elements.back();
+            ss >> cur->name >> cur->count;
+        } else if (tok == "property" && cur) {
+            Prop p;
+            std::string ptype; ss >> ptype;
+            if (ptype == "list") {
+                std::string ct, vt; ss >> ct >> vt;
+                std::string pname; ss >> pname;
+                p.name = pname; p.is_list = true;
+                p.list_cnt_type = ct; p.list_val_type = vt;
+                p.list_cnt_size = ply_type_size(ct);
+                p.list_val_size = ply_type_size(vt);
+                p.size = 0;
+                cur->stride = 0;  // variable-length element
+            } else {
+                ss >> p.name;
+                p.type = ptype;
+                p.size = ply_type_size(ptype);
+            }
+            cur->props.push_back(p);
         } else if (tok == "end_header") {
-            header = false;
+            // Compute fixed stride for each element (0 = has list props).
+            for (auto& e : elements) {
+                bool has_list = false;
+                int s = 0;
+                for (auto& pr : e.props) { if (pr.is_list) { has_list=true; break; } s+=pr.size; }
+                e.stride = has_list ? 0 : s;
+            }
+            break;
+        }
+    }
+    // Stream is now positioned at the first byte of data.
+
+    const Elem* vert_elem = nullptr;
+    const Elem* face_elem = nullptr;
+    for (auto& e : elements) {
+        if (e.name == "vertex" && !vert_elem) vert_elem = &e;
+        else if (e.name == "face" && !face_elem) face_elem = &e;
+    }
+    if (!vert_elem) throw std::runtime_error("PLY: no vertex element");
+
+    bool be = (fmt == Fmt::BE);
+    bool is_binary = (fmt != Fmt::ASCII);
+
+    // Find x, y, z property indices and their byte offsets within a vertex.
+    int xi=-1, yi=-1, zi=-1;
+    std::vector<int> v_offsets;
+    {
+        int off = 0;
+        for (int i = 0; i < (int)vert_elem->props.size(); i++) {
+            v_offsets.push_back(off);
+            const auto& pr = vert_elem->props[i];
+            if (pr.name=="x") xi=i; else if (pr.name=="y") yi=i; else if (pr.name=="z") zi=i;
+            off += pr.size;
+        }
+    }
+    int vstride = vert_elem->stride;
+
+    Mesh m;
+    m.vertices.reserve(vert_elem->count);
+    if (face_elem) m.triangles.reserve(face_elem->count);
+
+    // ---- Read vertices -------------------------------------------------------
+    if (is_binary) {
+        std::vector<char> buf(vstride);
+        for (int i = 0; i < vert_elem->count; i++) {
+            f.read(buf.data(), vstride);
+            auto rd = [&](int idx) -> double {
+                if (idx < 0) return 0.0;
+                return read_ply_scalar(buf.data()+v_offsets[idx],
+                                       vert_elem->props[idx].type, be);
+            };
+            m.vertices.push_back({rd(xi), rd(yi), rd(zi)});
+        }
+    } else {
+        for (int i = 0; i < vert_elem->count; i++) {
+            if (!std::getline(f, line)) break;
+            std::istringstream ss(line);
+            std::vector<double> vals(vert_elem->props.size());
+            for (auto& v : vals) ss >> v;
+            m.vertices.push_back({
+                xi>=0 ? vals[xi] : 0.0,
+                yi>=0 ? vals[yi] : 0.0,
+                zi>=0 ? vals[zi] : 0.0
+            });
         }
     }
 
-    if (binary)
-        throw std::runtime_error("Binary PLY not supported; convert to ASCII first.");
-
-    Mesh m;
-    m.vertices.reserve(n_verts);
-    m.triangles.reserve(n_faces);
-
-    for (int i = 0; i < n_verts; i++) {
-        if (!std::getline(f, line)) break;
-        std::istringstream ss(line);
-        Vec3 v;
-        ss >> v.x >> v.y >> v.z;
-        m.vertices.push_back(v);
+    // ---- Skip elements between vertex and face (rare but correct) -----------
+    // For the elements that appear before face_elem but after vert_elem,
+    // we need to skip their bytes in binary mode.
+    if (is_binary && face_elem) {
+        bool past_vert = false;
+        for (auto& e : elements) {
+            if (&e == vert_elem) { past_vert = true; continue; }
+            if (&e == face_elem) break;
+            if (!past_vert) continue;
+            if (e.stride > 0) {
+                f.seekg(static_cast<std::streamoff>(e.count) * e.stride, std::ios::cur);
+            }
+            // If stride==0 (has lists), skip is non-trivial; ignore rare case.
+        }
     }
 
-    for (int i = 0; i < n_faces; i++) {
-        if (!std::getline(f, line)) break;
-        std::istringstream ss(line);
-        int count;
-        ss >> count;
-        std::vector<int> vids(count);
-        for (int j = 0; j < count; j++) ss >> vids[j];
-        for (int j = 1; j + 1 < count; j++)
-            m.triangles.push_back({vids[0], vids[j], vids[j + 1]});
+    // ---- Read faces ---------------------------------------------------------
+    if (face_elem) {
+        // Find the list property for face vertex indices.
+        const Prop* list_prop = nullptr;
+        for (auto& pr : face_elem->props)
+            if (pr.is_list) { list_prop = &pr; break; }
+
+        if (!list_prop)
+            throw std::runtime_error("PLY: face element has no list property");
+
+        if (is_binary) {
+            char cnt_buf[8];
+            for (int i = 0; i < face_elem->count; i++) {
+                f.read(cnt_buf, list_prop->list_cnt_size);
+                int cnt = static_cast<int>(
+                    read_ply_scalar(cnt_buf, list_prop->list_cnt_type, be));
+                std::vector<int> vids(cnt);
+                char val_buf[8];
+                for (int j = 0; j < cnt; j++) {
+                    f.read(val_buf, list_prop->list_val_size);
+                    vids[j] = static_cast<int>(
+                        read_ply_scalar(val_buf, list_prop->list_val_type, be));
+                }
+                for (int j = 1; j+1 < cnt; j++)
+                    m.triangles.push_back({vids[0], vids[j], vids[j+1]});
+            }
+        } else {
+            for (int i = 0; i < face_elem->count; i++) {
+                if (!std::getline(f, line)) break;
+                std::istringstream ss(line);
+                int cnt; ss >> cnt;
+                std::vector<int> vids(cnt);
+                for (auto& v : vids) ss >> v;
+                for (int j = 1; j+1 < cnt; j++)
+                    m.triangles.push_back({vids[0], vids[j], vids[j+1]});
+            }
+        }
     }
 
     m.compute_vertex_normals();
@@ -466,5 +640,51 @@ void save_obj_polygons(const std::string& path,
         for (int idx : face)
             f << ' ' << (idx + 1);  // OBJ is 1-indexed
         f << '\n';
+    }
+}
+
+void save_ply_polygons(const std::string& path,
+                       const std::vector<Vec3>& vertices,
+                       const std::vector<std::vector<int>>& faces,
+                       bool binary) {
+    auto mode = binary ? (std::ios::binary | std::ios::out) : std::ios::out;
+    std::ofstream f(path, mode);
+    if (!f) throw std::runtime_error("Cannot write: " + path);
+
+    // Header is always ASCII.
+    f << "ply\n"
+      << (binary ? "format binary_little_endian 1.0\n" : "format ascii 1.0\n")
+      << "element vertex " << vertices.size() << "\n"
+      << "property float x\n"
+      << "property float y\n"
+      << "property float z\n"
+      << "element face " << faces.size() << "\n"
+      << "property list uchar int vertex_indices\n"
+      << "end_header\n";
+
+    if (binary) {
+        for (auto& v : vertices) {
+            float xyz[3] = {static_cast<float>(v.x),
+                            static_cast<float>(v.y),
+                            static_cast<float>(v.z)};
+            f.write(reinterpret_cast<const char*>(xyz), 12);
+        }
+        for (auto& face : faces) {
+            uint8_t cnt = static_cast<uint8_t>(face.size());
+            f.write(reinterpret_cast<const char*>(&cnt), 1);
+            for (int idx : face) {
+                int32_t i32 = idx;
+                f.write(reinterpret_cast<const char*>(&i32), 4);
+            }
+        }
+    } else {
+        f.precision(7);
+        for (auto& v : vertices)
+            f << v.x << ' ' << v.y << ' ' << v.z << '\n';
+        for (auto& face : faces) {
+            f << face.size();
+            for (int idx : face) f << ' ' << idx;
+            f << '\n';
+        }
     }
 }

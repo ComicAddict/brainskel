@@ -14,6 +14,8 @@ struct SampledPoints {
 SampledPoints poisson_disk_sample(const Mesh& mesh, double min_radius,
                                    unsigned int seed = 42);
 
-// Text format: one sample per line "x y z nx ny nz"
-void save_points(const std::string& path, const SampledPoints& pts);
+// PLY point cloud (x y z nx ny nz as double).
+// binary=true → binary_little_endian (default); false → ASCII.
+void save_points(const std::string& path, const SampledPoints& pts,
+                 bool binary = true);
 SampledPoints load_points(const std::string& path);

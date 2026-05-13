@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <cstdint>
 #include <fstream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -150,12 +153,13 @@ SampledPoints poisson_disk_sample(const Mesh& mesh, double min_radius,
 // I/O  (PLY ASCII with x y z nx ny nz — importable in Blender as point cloud)
 // ---------------------------------------------------------------------------
 
-void save_points(const std::string& path, const SampledPoints& pts) {
-    std::ofstream f(path);
+void save_points(const std::string& path, const SampledPoints& pts, bool binary) {
+    auto mode = binary ? (std::ios::binary | std::ios::out) : std::ios::out;
+    std::ofstream f(path, mode);
     if (!f) throw std::runtime_error("Cannot write: " + path);
 
     f << "ply\n"
-      << "format ascii 1.0\n"
+      << (binary ? "format binary_little_endian 1.0\n" : "format ascii 1.0\n")
       << "element vertex " << pts.positions.size() << "\n"
       << "property double x\n"
       << "property double y\n"
@@ -165,45 +169,137 @@ void save_points(const std::string& path, const SampledPoints& pts) {
       << "property double nz\n"
       << "end_header\n";
 
-    f.precision(10);
-    for (size_t i = 0; i < pts.positions.size(); i++) {
-        const auto& p = pts.positions[i];
-        const auto& n = pts.normals[i];
-        f << p.x << ' ' << p.y << ' ' << p.z << ' '
-          << n.x << ' ' << n.y << ' ' << n.z << '\n';
+    if (binary) {
+        for (size_t i = 0; i < pts.positions.size(); i++) {
+            double row[6] = {pts.positions[i].x, pts.positions[i].y, pts.positions[i].z,
+                             pts.normals[i].x,   pts.normals[i].y,   pts.normals[i].z};
+            f.write(reinterpret_cast<const char*>(row), 48);
+        }
+    } else {
+        f.precision(10);
+        for (size_t i = 0; i < pts.positions.size(); i++) {
+            const auto& p = pts.positions[i];
+            const auto& n = pts.normals[i];
+            f << p.x << ' ' << p.y << ' ' << p.z << ' '
+              << n.x << ' ' << n.y << ' ' << n.z << '\n';
+        }
     }
 }
 
 SampledPoints load_points(const std::string& path) {
-    std::ifstream f(path);
+    // Open in binary mode so tellg()/read() work for binary PLY.
+    std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open: " + path);
 
     std::string line;
     std::getline(f, line);
+    if (!line.empty() && line.back() == '\r') line.pop_back();
 
     // PLY file
     if (line == "ply") {
+        enum class Fmt { ASCII, LE, BE } fmt = Fmt::ASCII;
         int n_verts = 0;
-        // Minimal header parse: find "element vertex N" and "end_header".
+
+        // Track the 6 properties we care about (x y z nx ny nz):
+        // store their index in the property list and their type.
+        struct PropInfo { std::string name, type; int size; };
+        std::vector<PropInfo> props;
+        bool in_vertex = false;
+
         while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
             std::istringstream ss(line);
-            std::string tok;
-            ss >> tok;
-            if (tok == "element") {
-                std::string name; ss >> name >> n_verts;
+            std::string tok; ss >> tok;
+            if (tok == "format") {
+                std::string s; ss >> s;
+                if (s == "binary_little_endian") fmt = Fmt::LE;
+                else if (s == "binary_big_endian") fmt = Fmt::BE;
+            } else if (tok == "element") {
+                std::string name; int cnt; ss >> name >> cnt;
+                in_vertex = (name == "vertex");
+                if (in_vertex) n_verts = cnt;
+            } else if (tok == "property" && in_vertex) {
+                std::string type, name; ss >> type >> name;
+                if (type != "list") {
+                    int sz = 0;
+                    if (type=="char"||type=="int8"||type=="uchar"||type=="uint8") sz=1;
+                    else if (type=="short"||type=="int16"||type=="ushort"||type=="uint16") sz=2;
+                    else if (type=="int"||type=="int32"||type=="uint"||type=="uint32"||
+                             type=="float"||type=="float32") sz=4;
+                    else if (type=="double"||type=="float64") sz=8;
+                    props.push_back({name, type, sz});
+                }
             } else if (tok == "end_header") {
                 break;
             }
         }
+        // Stream is now at first data byte.
+
+        // Map property name → index in props[]
+        auto find_prop = [&](const std::string& name) -> int {
+            for (int i = 0; i < (int)props.size(); i++)
+                if (props[i].name == name) return i;
+            return -1;
+        };
+        int xi=find_prop("x"), yi=find_prop("y"), zi=find_prop("z");
+        int nxi=find_prop("nx"), nyi=find_prop("ny"), nzi=find_prop("nz");
+
         SampledPoints pts;
         pts.positions.reserve(n_verts);
         pts.normals.reserve(n_verts);
-        for (int i = 0; i < n_verts && std::getline(f, line); i++) {
-            std::istringstream ss(line);
-            Vec3 p, n;
-            if (ss >> p.x >> p.y >> p.z >> n.x >> n.y >> n.z) {
-                pts.positions.push_back(p);
-                pts.normals.push_back(n);
+
+        bool is_binary = (fmt != Fmt::ASCII);
+        bool be = (fmt == Fmt::BE);
+
+        if (is_binary) {
+            // Compute stride and per-property offsets.
+            int stride = 0;
+            std::vector<int> offsets;
+            for (auto& p : props) { offsets.push_back(stride); stride += p.size; }
+
+            // Helper: read one double from a buffer position.
+            auto rd = [&](const char* buf, int idx) -> double {
+                if (idx < 0) return 0.0;
+                const char* p = buf + offsets[idx];
+                const std::string& type = props[idx].type;
+                if (type=="double"||type=="float64") {
+                    uint64_t u; memcpy(&u,p,8);
+                    if (be) u=__builtin_bswap64(u);
+                    double v; memcpy(&v,&u,8); return v;
+                }
+                if (type=="float"||type=="float32") {
+                    uint32_t u; memcpy(&u,p,4);
+                    if (be) u=__builtin_bswap32(u);
+                    float v; memcpy(&v,&u,4); return v;
+                }
+                // integer types: treat as signed
+                if (props[idx].size == 4) {
+                    uint32_t u; memcpy(&u,p,4);
+                    if (be) u=__builtin_bswap32(u);
+                    return static_cast<int32_t>(u);
+                }
+                if (props[idx].size == 2) {
+                    uint16_t u; memcpy(&u,p,2);
+                    if (be) u=__builtin_bswap16(u);
+                    return static_cast<int16_t>(u);
+                }
+                return static_cast<int8_t>(p[0]);
+            };
+
+            std::vector<char> buf(stride);
+            for (int i = 0; i < n_verts; i++) {
+                if (!f.read(buf.data(), stride)) break;
+                pts.positions.push_back({rd(buf.data(),xi), rd(buf.data(),yi), rd(buf.data(),zi)});
+                pts.normals.push_back({rd(buf.data(),nxi), rd(buf.data(),nyi), rd(buf.data(),nzi)});
+            }
+        } else {
+            for (int i = 0; i < n_verts && std::getline(f, line); i++) {
+                std::istringstream ss(line);
+                Vec3 p, n;
+                if (ss >> p.x >> p.y >> p.z >> n.x >> n.y >> n.z) {
+                    pts.positions.push_back(p);
+                    pts.normals.push_back(n);
+                }
             }
         }
         return pts;
