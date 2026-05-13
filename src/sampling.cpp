@@ -153,14 +153,19 @@ SampledPoints poisson_disk_sample(const Mesh& mesh, double min_radius,
 // I/O  (PLY ASCII with x y z nx ny nz — importable in Blender as point cloud)
 // ---------------------------------------------------------------------------
 
-void save_points(const std::string& path, const SampledPoints& pts, bool binary) {
+void save_points(const std::string& path, const SampledPoints& pts,
+                 bool binary, double sampling_radius) {
     auto mode = binary ? (std::ios::binary | std::ios::out) : std::ios::out;
     std::ofstream f(path, mode);
     if (!f) throw std::runtime_error("Cannot write: " + path);
 
     f << "ply\n"
-      << (binary ? "format binary_little_endian 1.0\n" : "format ascii 1.0\n")
-      << "element vertex " << pts.positions.size() << "\n"
+      << (binary ? "format binary_little_endian 1.0\n" : "format ascii 1.0\n");
+    if (sampling_radius > 0.0) {
+        f.precision(17);
+        f << "comment sampling_radius " << sampling_radius << "\n";
+    }
+    f << "element vertex " << pts.positions.size() << "\n"
       << "property double x\n"
       << "property double y\n"
       << "property double z\n"
@@ -186,7 +191,9 @@ void save_points(const std::string& path, const SampledPoints& pts, bool binary)
     }
 }
 
-SampledPoints load_points(const std::string& path) {
+SampledPoints load_points(const std::string& path, double* out_sampling_radius) {
+    if (out_sampling_radius) *out_sampling_radius = -1.0;
+
     // Open in binary mode so tellg()/read() work for binary PLY.
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open: " + path);
@@ -210,7 +217,12 @@ SampledPoints load_points(const std::string& path) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             std::istringstream ss(line);
             std::string tok; ss >> tok;
-            if (tok == "format") {
+            if (tok == "comment") {
+                std::string key; ss >> key;
+                if (key == "sampling_radius" && out_sampling_radius) {
+                    double r; if (ss >> r) *out_sampling_radius = r;
+                }
+            } else if (tok == "format") {
                 std::string s; ss >> s;
                 if (s == "binary_little_endian") fmt = Fmt::LE;
                 else if (s == "binary_big_endian") fmt = Fmt::BE;

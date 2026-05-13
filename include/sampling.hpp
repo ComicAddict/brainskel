@@ -14,8 +14,16 @@ struct SampledPoints {
 SampledPoints poisson_disk_sample(const Mesh& mesh, double min_radius,
                                    unsigned int seed = 42);
 
-// PLY point cloud (x y z nx ny nz as double).
+// PLY point cloud with per-sample positions (x y z) and outward normals
+// (nx ny nz) stored as double.  sampling_radius, if > 0, is written as a
+// PLY comment so the file is self-describing for medial-axis reconstruction.
 // binary=true → binary_little_endian (default); false → ASCII.
 void save_points(const std::string& path, const SampledPoints& pts,
-                 bool binary = true);
-SampledPoints load_points(const std::string& path);
+                 bool binary = true, double sampling_radius = -1.0);
+
+// Load a PLY point cloud written by save_points.
+// If out_sampling_radius is non-null and the file contains a
+// "comment sampling_radius R" line, *out_sampling_radius is set to R;
+// otherwise it is set to -1.
+SampledPoints load_points(const std::string& path,
+                          double* out_sampling_radius = nullptr);

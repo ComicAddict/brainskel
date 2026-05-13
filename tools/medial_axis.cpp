@@ -101,10 +101,17 @@ int main(int argc, char** argv) {
 
         if (!points_file.empty()) {
             std::cerr << "Loading pre-sampled points: " << points_file << " ...\n";
-            pts = load_points(points_file);
+            double stored_radius = -1.0;
+            pts = load_points(points_file, &stored_radius);
             t_load = elapsed(t0, Clock::now());
             std::cerr << "  " << pts.positions.size() << " points  ["
                       << t_load << " s]\n";
+            // Use the sampling radius stored in the PLY so epsilon is
+            // computed identically to a direct (no --points) run.
+            if (radius <= 0.0 && stored_radius > 0.0) {
+                radius = stored_radius;
+                std::cerr << "  Sampling radius from file: " << radius << "\n";
+            }
         } else {
             std::cerr << "Loading mesh: " << input << " ...\n";
             Mesh mesh = load_mesh(input);

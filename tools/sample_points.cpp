@@ -13,8 +13,14 @@ static void usage(const char* argv0) {
         "                   [--seed S]     RNG seed (default: 42)\n"
         "                   [--ascii]      write ASCII PLY (default: binary)\n"
         "\n"
-        "Samples points on the mesh surface using Poisson-disk sampling.\n"
-        "Output is a PLY point cloud (x y z nx ny nz) importable in Blender.\n";
+        "Samples points on the mesh surface using Poisson-disk sampling and writes\n"
+        "a PLY point cloud.  Each vertex carries:\n"
+        "  x y z     — position\n"
+        "  nx ny nz  — outward surface normal (needed for medial-axis reconstruction)\n"
+        "\n"
+        "The sampling radius is stored as a PLY comment so that\n"
+        "  medial_axis <mesh> <out> --points <output.ply>\n"
+        "can reproduce the exact same epsilon as a direct run.\n";
 }
 
 int main(int argc, char** argv) {
@@ -58,7 +64,7 @@ int main(int argc, char** argv) {
 
         std::cerr << "Writing: " << output
                   << " (" << (binary ? "binary" : "ascii") << " PLY) ...\n";
-        save_points(output, pts, binary);
+        save_points(output, pts, binary, radius);
         std::cerr << "Done.\n";
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << '\n';
